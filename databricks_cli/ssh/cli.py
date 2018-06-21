@@ -28,10 +28,17 @@ import ssl
 import struct
 import termios
 import sys
+import os
 from tabulate import tabulate
 import tty
 from select import select
 import traceback
+
+try:
+    from shutil import get_terminal_size
+except ImportError:
+    from backports.shutil_get_terminal_size import get_terminal_size
+
 
 from databricks_cli.click_types import OutputClickType, JsonClickType, JobIdClickType
 from databricks_cli.jobs.api import JobsApi
@@ -53,6 +60,7 @@ STREAM_INDICATOR_ERROR = 2
 STREAM_INDICATOR_STATUS = 3
 
 INPUT_INDICATOR_STDIN = 1
+INPUT_INDICATOR_TERMSIZE = 2
 
 def on_data(ws, message, opcode, initial):
     # print("[Received: %s, opcode=%s, len=%s]" % (type(message), opcode, len(message)))
@@ -70,9 +78,8 @@ def on_message(ws, message):
         # ignore length
         str_msg = bytearray(message[5:])
         if stream_indicator == STREAM_INDICATOR_OUTPUT:
-            # sys.stdout.write(str_msg)
-            # sys.stdout.flush()
-            pass
+            sys.stdout.write(str_msg)
+            sys.stdout.flush()
         elif stream_indicator == STREAM_INDICATOR_ERROR:
             sys.stderr.write(str_msg)
             sys.stderr.flush()
@@ -98,23 +105,29 @@ def has_stdin():
 def stdin_loop(ws):
     old_settings = termios.tcgetattr(sys.stdin)
     try:
-        tty.setcbreak(sys.stdin.fileno())
+        tty.setraw(sys.stdin.fileno()) # cbreak?
         while True:
-            readables, writeables, exceptions = select([sys.stdin], [], [], 0.001)
+            readables, writeables, exceptions = select([sys.stdin], [], [], 0.025)
             # print("Have bytes? %s" % has_stdin())
-            buf = bytearray()
-            buf.append(INPUT_INDICATOR_STDIN)
-            while has_stdin() and len(buf) < 1024:
-                b=sys.stdin.read(1)
-                # print("Now has_stdin=%s" % has_stdin())
+            buf = bytearray([INPUT_INDICATOR_STDIN])
+            
+            bytes_read = os.read(sys.stdin.fileno(), 1024)
+            for b in bytes_read:
                 buf.append(b)
             if len(buf) > 1:
                 ws.send(str(buf), websocket.ABNF.OPCODE_BINARY)
-                sys.stderr.write("Sent %s bytes" % len(buf))
+                # sys.stderr.write("Sent %s bytes" % len(buf))
     except Exception, err:
         traceback.print_exc()
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def send_termsize(ws):
+    term_size = get_terminal_size((80, 20))
+    termsize_buf = buf = bytearray([INPUT_INDICATOR_TERMSIZE])
+    termsize_buf += bytearray.fromhex('{:08x}'.format(term_size.columns))
+    termsize_buf += bytearray.fromhex('{:08x}'.format(term_size.lines))
+    ws.send(str(termsize_buf), websocket.ABNF.OPCODE_BINARY)
 
 @click.command(context_settings=CONTEXT_SETTINGS)
 @click.argument("command")
@@ -137,6 +150,7 @@ def exec_cmd(api_client, command):
             traceback.print_exc()
 
         ws.send('{ "command": { "command" : "%s" } }' % command)
+        send_termsize(ws)
 
     websocket.enableTrace(True)
     ws = websocket.WebSocketApp(#"wss://%s/" % api_client.host,
