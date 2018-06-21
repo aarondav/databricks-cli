@@ -8,3 +8,4 @@ decorator==4.2.1
 rstcheck==3.2
 pytest-cov
 codecov
+websocket-client==0.48.0
