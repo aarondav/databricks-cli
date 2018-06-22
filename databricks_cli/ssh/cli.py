@@ -21,121 +21,73 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from json import loads as json_loads
-
+import atexit
 import click
-import ssl
+import json
+import os
 import struct
 import termios
-import sys
-import os
-from tabulate import tabulate
-import tty
 from select import select
+import sys
+import time
+import tty
 import traceback
-import shlex
-import json
+import websocket
 
 try:
     from shutil import get_terminal_size
 except ImportError:
     from backports.shutil_get_terminal_size import get_terminal_size
 
-
-from databricks_cli.click_types import OutputClickType, JsonClickType, JobIdClickType
-from databricks_cli.jobs.api import JobsApi
-from databricks_cli.utils import eat_exceptions, CONTEXT_SETTINGS, pretty_format, json_cli_base, \
-    truncate_string
-from databricks_cli.configure.config import provide_api_client, profile_option
-from databricks_cli.version import print_version_callback, version
-
-
-import websocket
 try:
     import thread
 except ImportError:
     import _thread as thread
-import time
 
-STREAM_INDICATOR_OUTPUT = 1
-STREAM_INDICATOR_ERROR = 2
-STREAM_INDICATOR_STATUS = 3
-STREAM_INDICATOR_CONNECTED = 4
+from databricks_cli.configure.config import provide_api_client, profile_option
+from databricks_cli.utils import eat_exceptions, CONTEXT_SETTINGS
+from databricks_cli.ssh_utils import launch_websocket_blocking, send_control_message, \
+  MESSAGE_CONNECTED, MESSAGE_OUTPUT_FRAME, MESSAGE_ERROR_FRAME, MESSAGE_EXITED, \
+  MESSAGE_SERVICE_EXCEPTION, MESSAGE_INPUT_FRAME, MESSAGE_TERMSIZE
 
-INPUT_INDICATOR_STDIN = 1
-INPUT_INDICATOR_TERMSIZE = 2
-
-def on_data(ws, message, opcode, initial):
-    # print("[Received: %s, opcode=%s, len=%s]" % (type(message), opcode, len(message)))
-    pass
 
 exit_code = None
 command_to_run = None
+last_termsize = None
 
-def on_message(ws, message):
-    global exit_code
-    try:
-        # WARNING: python2 compatability problems!!
-        bytes = bytearray(message)
-        stream_indicator = bytes[0]
-        # print("INDICATOR=%s" % stream_indicator)
-        # ignore length
-        str_msg = bytearray(message[5:])
-        if stream_indicator == STREAM_INDICATOR_OUTPUT:
-            sys.stdout.write(str_msg)
-            sys.stdout.flush()
-        elif stream_indicator == STREAM_INDICATOR_ERROR:
-            sys.stderr.write(str_msg)
-            sys.stderr.flush()
-        elif stream_indicator == STREAM_INDICATOR_STATUS:
-            exit_code = struct.unpack("<L", bytearray(bytes[1:5]))[0]
-        elif stream_indicator == STREAM_INDICATOR_CONNECTED:
-            commandJson = json.dumps({"commandList": command_to_run})
-            ws.send(commandJson)
-            send_termsize(ws)
-            thread.start_new_thread(maintain_termsize, (ws,))
-            thread.start_new_thread(stdin_loop, (ws,))
-            # print("exit code set: %s" % exit_code)
-        else:
-            sys.stderr.write("INDICATOR=%s" % stream_indicator)
-            raise Error("Unknown stream indicator: %s" % stream_indicator)
-    except Exception, err:
-        traceback.print_exc()
+def on_connect(ws):
+    commandJson = json.dumps({"commandList": command_to_run})
+    ws.send(commandJson)
+    thread.start_new_thread(maintain_termsize, (ws,))
+    thread.start_new_thread(stdin_loop, (ws,))
 
-def on_error(ws, error):
-    sys.stderr.write("Error: %s, type=%s" % (error, type(error)))
-    traceback.print_exc()
-
-
-def on_close(ws):
-    # sys.stderr.write("### closed ###")
-    pass
-
-def has_stdin():
-    return select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
+def on_message(ws, message_type, message_bytes):
+    if message_type == MESSAGE_CONNECTED:
+        on_connect(ws)
+    elif message_type == MESSAGE_OUTPUT_FRAME:
+        sys.stdout.write(message_bytes)
+        sys.stdout.flush()
+    elif message_type == MESSAGE_ERROR_FRAME:
+        sys.stderr.write(message_bytes)
+        sys.stderr.flush()
+    elif message_type == MESSAGE_EXITED:
+        # TODO: This is not correct, negative numbers are exploded.
+        # print("MESSAGE: %s %s" % (message_type, message_bytes))
+        exit_code = int(message_bytes.decode("UTF-8"))
+    else:
+        raise Error("Unknown stream indicator: %s" % message_type)
 
 def stdin_loop(ws):
-    # TODO: Maybe just use curses?
-    old_settings = termios.tcgetattr(sys.stdin)
     try:
-        tty.setraw(sys.stdin.fileno()) # cbreak?
+        tty.setraw(sys.stdin.fileno())
         while True:
             readables, writeables, exceptions = select([sys.stdin], [], [], 0.025)
-            # print("Have bytes? %s" % has_stdin())
-            buf = bytearray([INPUT_INDICATOR_STDIN])
-            
             bytes_read = os.read(sys.stdin.fileno(), 1024)
-            for b in bytes_read:
-                buf.append(b)
-            if len(buf) > 1:
-                ws.send(str(buf), websocket.ABNF.OPCODE_BINARY)
-                # sys.stderr.write("Sent %s bytes" % len(buf))
+            buf = bytearray(bytes_read)
+            if buf:
+                send_control_message(ws, MESSAGE_INPUT_FRAME, buf)
     except Exception, err:
         traceback.print_exc()
-    finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-last_termsize = None
 
 def send_termsize(ws):
     global last_termsize
@@ -145,23 +97,35 @@ def send_termsize(ws):
         return
 
     last_termsize = term_size
-    termsize_buf = buf = bytearray([INPUT_INDICATOR_TERMSIZE])
-    termsize_buf += bytearray.fromhex('{:08x}'.format(term_size.columns))
+    termsize_buf = bytearray.fromhex('{:08x}'.format(term_size.columns))
     termsize_buf += bytearray.fromhex('{:08x}'.format(term_size.lines))
     ws.send(str(termsize_buf), websocket.ABNF.OPCODE_BINARY)
+    send_control_message(ws, MESSAGE_TERMSIZE, termsize_buf)
 
 def maintain_termsize(ws):
-    while True:
-        send_termsize(ws)
-        time.sleep(0.25)
+    try:
+        while True:
+            send_termsize(ws)
+            time.sleep(0.25)
+    except Exception, err:
+        traceback.print_exc()
+
+def restore_terminal_at_exit():
+    old_settings = termios.tcgetattr(sys.stdin)
+    def restore_terminal():
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+    atexit.register(restore_terminal)
+
+
 
 @click.command(context_settings=CONTEXT_SETTINGS)
-@click.option("--cluster-id", "-c")
-@click.argument("command")
+@click.argument("cluster-id")
+@click.argument("command", nargs=-1)
 @profile_option
 @eat_exceptions
 @provide_api_client
-def exec_cmd(api_client, cluster_id, command):
+def ssh_cmd(api_client, cluster_id, command):
     """
     Creates a job.
 
@@ -169,48 +133,11 @@ def exec_cmd(api_client, cluster_id, command):
     https://docs.databricks.com/api/latest/jobs.html#create
     """
     global exit_code, command_to_run
-    command_to_run = shlex.split(command)
+    command_to_run = list(command)
+    if not command_to_run:
+        command_to_run = ["/bin/bash"]
+    restore_terminal_at_exit()
 
-    def on_open(ws):
-        ws.send('{ "cluster_id": "%s" }' % (cluster_id,))
-
-    host = api_client.host.replace("https://", "wss://").replace("http://", "ws://")
-    if not host.endswith("/"):
-        host += "/"
-    host += "ssh"
-    websocket.enableTrace(True)
-    ws = websocket.WebSocketApp(host,
-                              # "ws://localhost:5059/",
-                              header = api_client.default_headers,
-                              on_data = on_data,
-                              on_message = on_message,
-                              on_error = on_error,
-                              on_open = on_open,
-                              on_close = on_close)
-    # TODO: no_verify
-    # ssl_opt = {}
-    # if not api_client.verify:
-    #     ssl_opt = {"cert_reqs": ssl.CERT_NONE}
-    ws.run_forever()
+    launch_websocket_blocking(api_client, cluster_id, on_message)
     if exit_code:
-        print("Exiting %s" % exit_code)
         sys.exit(exit_code)
-
-
-@click.group(context_settings=CONTEXT_SETTINGS,
-             short_help='Utility to interact with jobs.')
-@click.option('--version', '-v', is_flag=True, callback=print_version_callback,
-              expose_value=False, is_eager=True, help=version)
-@profile_option
-@eat_exceptions
-def ssh_group():
-    """
-    Utility to interact with jobs.
-
-    This is a wrapper around the jobs API (https://docs.databricks.com/api/latest/jobs.html).
-    Job runs are handled by ``databricks runs``.
-    """
-    pass
-
-
-ssh_group.add_command(exec_cmd, name='exec')
