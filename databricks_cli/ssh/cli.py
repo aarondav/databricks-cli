@@ -33,6 +33,8 @@ from tabulate import tabulate
 import tty
 from select import select
 import traceback
+import shlex
+import json
 
 try:
     from shutil import get_terminal_size
@@ -58,6 +60,7 @@ import time
 STREAM_INDICATOR_OUTPUT = 1
 STREAM_INDICATOR_ERROR = 2
 STREAM_INDICATOR_STATUS = 3
+STREAM_INDICATOR_CONNECTED = 4
 
 INPUT_INDICATOR_STDIN = 1
 INPUT_INDICATOR_TERMSIZE = 2
@@ -67,6 +70,7 @@ def on_data(ws, message, opcode, initial):
     pass
 
 exit_code = None
+command_to_run = None
 
 def on_message(ws, message):
     global exit_code
@@ -85,6 +89,12 @@ def on_message(ws, message):
             sys.stderr.flush()
         elif stream_indicator == STREAM_INDICATOR_STATUS:
             exit_code = struct.unpack("<L", bytearray(bytes[1:5]))[0]
+        elif stream_indicator == STREAM_INDICATOR_CONNECTED:
+            commandJson = json.dumps({"commandList": command_to_run})
+            ws.send(commandJson)
+            send_termsize(ws)
+            thread.start_new_thread(maintain_termsize, (ws,))
+            thread.start_new_thread(stdin_loop, (ws,))
             # print("exit code set: %s" % exit_code)
         else:
             sys.stderr.write("INDICATOR=%s" % stream_indicator)
@@ -93,7 +103,9 @@ def on_message(ws, message):
         traceback.print_exc()
 
 def on_error(ws, error):
-    sys.stderr.write("Error: %s" % error)
+    sys.stderr.write("Error: %s, type=%s" % (error, type(error)))
+    traceback.print_exc()
+
 
 def on_close(ws):
     # sys.stderr.write("### closed ###")
@@ -103,6 +115,7 @@ def has_stdin():
     return select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
 
 def stdin_loop(ws):
+    # TODO: Maybe just use curses?
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno()) # cbreak?
@@ -122,39 +135,52 @@ def stdin_loop(ws):
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
+last_termsize = None
+
 def send_termsize(ws):
+    global last_termsize
     term_size = get_terminal_size((80, 20))
+
+    if last_termsize == term_size:
+        return
+
+    last_termsize = term_size
     termsize_buf = buf = bytearray([INPUT_INDICATOR_TERMSIZE])
     termsize_buf += bytearray.fromhex('{:08x}'.format(term_size.columns))
     termsize_buf += bytearray.fromhex('{:08x}'.format(term_size.lines))
     ws.send(str(termsize_buf), websocket.ABNF.OPCODE_BINARY)
 
+def maintain_termsize(ws):
+    while True:
+        send_termsize(ws)
+        time.sleep(0.25)
+
 @click.command(context_settings=CONTEXT_SETTINGS)
+@click.option("--cluster-id", "-c")
 @click.argument("command")
 @profile_option
 @eat_exceptions
 @provide_api_client
-def exec_cmd(api_client, command):
+def exec_cmd(api_client, cluster_id, command):
     """
     Creates a job.
 
     The specification for the json option can be found
     https://docs.databricks.com/api/latest/jobs.html#create
     """
-    global exit_code
+    global exit_code, command_to_run
+    command_to_run = shlex.split(command)
 
     def on_open(ws):
-        try:
-            thread.start_new_thread(stdin_loop, (ws,))
-        except Exception, err:
-            traceback.print_exc()
+        ws.send('{ "cluster_id": "%s" }' % (cluster_id,))
 
-        ws.send('{ "command": { "command" : "%s" } }' % command)
-        send_termsize(ws)
-
+    host = api_client.host.replace("https://", "wss://").replace("http://", "ws://")
+    if not host.endswith("/"):
+        host += "/"
+    host += "ssh"
     websocket.enableTrace(True)
-    ws = websocket.WebSocketApp(#"wss://%s/" % api_client.host,
-                              "ws://localhost:5059/",
+    ws = websocket.WebSocketApp(host,
+                              # "ws://localhost:5059/",
                               header = api_client.default_headers,
                               on_data = on_data,
                               on_message = on_message,
