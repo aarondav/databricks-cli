@@ -125,7 +125,7 @@ def restore_terminal_at_exit():
 @profile_option
 @eat_exceptions
 @provide_api_client
-def ssh_cmd(api_client, cluster_id, command):
+def shell_cmd(api_client, cluster_id, command):
     """
     Creates a job.
 

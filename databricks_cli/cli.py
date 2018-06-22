@@ -34,7 +34,7 @@ from databricks_cli.jobs.cli import jobs_group
 from databricks_cli.clusters.cli import clusters_group
 from databricks_cli.runs.cli import runs_group
 from databricks_cli.secrets.cli import secrets_group
-from databricks_cli.ssh.cli import ssh_cmd
+from databricks_cli.shell.cli import shell_cmd
 # from databricks_cli.port_forward.cli import port_forward_cmd
 
 
@@ -54,5 +54,5 @@ cli.add_command(clusters_group, name='clusters')
 cli.add_command(runs_group, name='runs')
 cli.add_command(libraries_group, name='libraries')
 cli.add_command(secrets_group, name='secrets')
-cli.add_command(ssh_cmd, name='ssh')
+cli.add_command(shell_cmd, name='shell')
 # cli.add_command(port_forward_cmd, name='port-forward')
