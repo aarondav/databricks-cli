@@ -46,7 +46,7 @@ except ImportError:
 
 from databricks_cli.configure.config import provide_api_client, profile_option
 from databricks_cli.utils import eat_exceptions, CONTEXT_SETTINGS
-from databricks_cli.ssh_utils import launch_websocket_blocking, send_control_message, \
+from databricks_cli.ssh_utils import create_websocket, send_control_message, \
   MESSAGE_CONNECTED, MESSAGE_OUTPUT_FRAME, MESSAGE_ERROR_FRAME, MESSAGE_EXITED, \
   MESSAGE_SERVICE_EXCEPTION, MESSAGE_INPUT_FRAME, MESSAGE_TERMSIZE
 
@@ -138,6 +138,8 @@ def ssh_cmd(api_client, cluster_id, command):
         command_to_run = ["/bin/bash"]
     restore_terminal_at_exit()
 
-    launch_websocket_blocking(api_client, cluster_id, on_message)
+    ws, sslopt = create_websocket(api_client, cluster_id, on_message)
+    ws.run_forever(sslopt=sslopt)
+
     if exit_code:
         sys.exit(exit_code)
