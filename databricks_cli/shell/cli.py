@@ -47,24 +47,31 @@ except ImportError:
 from databricks_cli.configure.config import provide_api_client, profile_option
 from databricks_cli.utils import eat_exceptions, CONTEXT_SETTINGS
 from databricks_cli.ssh_utils import create_websocket, send_control_message, \
-  MESSAGE_CONNECTED, MESSAGE_OUTPUT_FRAME, MESSAGE_ERROR_FRAME, MESSAGE_EXITED, \
-  MESSAGE_SERVICE_EXCEPTION, MESSAGE_INPUT_FRAME, MESSAGE_TERMSIZE
+  MESSAGE_OUTPUT_FRAME, MESSAGE_ERROR_FRAME, MESSAGE_EXITED, \
+  MESSAGE_INPUT_FRAME, MESSAGE_TERMSIZE
 
 
 exit_code = None
 command_to_run = None
 last_termsize = None
+allocate_tty = False
 
 def on_connect(ws):
-    commandJson = json.dumps({"commandList": command_to_run})
+    commandJson = json.dumps({
+        "commandList": command_to_run,
+        "allocate_pty": allocate_tty,
+    })
     ws.send(commandJson)
     thread.start_new_thread(maintain_termsize, (ws,))
     thread.start_new_thread(stdin_loop, (ws,))
 
-def on_message(ws, message_type, message_bytes):
-    if message_type == MESSAGE_CONNECTED:
-        on_connect(ws)
-    elif message_type == MESSAGE_OUTPUT_FRAME:
+def on_text_message(ws, message_str):
+    response = json.loads(message_str)
+    assert response["connected"], "Invalid connect message: %s" % message_str
+    on_connect(ws)
+
+def on_binary_message(ws, message_type, message_bytes):
+    if message_type == MESSAGE_OUTPUT_FRAME:
         sys.stdout.write(message_bytes)
         sys.stdout.flush()
     elif message_type == MESSAGE_ERROR_FRAME:
@@ -120,25 +127,27 @@ def restore_terminal_at_exit():
 
 
 @click.command(context_settings=CONTEXT_SETTINGS)
+@click.option("--tty", "-t", default=False, help="Allocate a tty")
 @click.argument("cluster-id")
 @click.argument("command", nargs=-1)
 @profile_option
 @eat_exceptions
 @provide_api_client
-def shell_cmd(api_client, cluster_id, command):
+def shell_cmd(api_client, tty, cluster_id, command):
     """
     Creates a job.
 
     The specification for the json option can be found
     https://docs.databricks.com/api/latest/jobs.html#create
     """
-    global exit_code, command_to_run
+    global exit_code, command_to_run, allocate_tty
+    allocate_tty = tty
     command_to_run = list(command)
     if not command_to_run:
         command_to_run = ["/bin/bash"]
     restore_terminal_at_exit()
 
-    ws, sslopt = create_websocket(api_client, cluster_id, on_message)
+    ws, sslopt = create_websocket(api_client, cluster_id, on_text_message, on_binary_message)
     ws.run_forever(sslopt=sslopt)
 
     if exit_code:
