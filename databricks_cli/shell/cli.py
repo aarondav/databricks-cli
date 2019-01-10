@@ -56,9 +56,13 @@ command_to_run = None
 last_termsize = None
 allocate_tty = False
 
+def log_debug(msg):
+    print(msg)
+
 def on_connect(ws):
+    log_debug("Connect completed")
     commandJson = json.dumps({
-        "commandList": command_to_run,
+        "command_list": command_to_run, # TODO
         "allocate_pty": allocate_tty,
     })
     ws.send(commandJson)
@@ -71,6 +75,7 @@ def on_text_message(ws, message_str):
     on_connect(ws)
 
 def on_binary_message(ws, message_type, message_bytes):
+    log_debug("Binary message receieved: %s" % message_type)
     if message_type == MESSAGE_OUTPUT_FRAME:
         sys.stdout.write(message_bytes)
         sys.stdout.flush()
@@ -127,7 +132,7 @@ def restore_terminal_at_exit():
 
 
 @click.command(context_settings=CONTEXT_SETTINGS)
-@click.option("--tty", "-t", default=False, help="Allocate a tty")
+@click.option("--tty", "-t", is_flag=True, default=False, help="Allocate a tty")
 @click.argument("cluster-id")
 @click.argument("command", nargs=-1)
 @profile_option
@@ -148,7 +153,9 @@ def shell_cmd(api_client, tty, cluster_id, command):
     restore_terminal_at_exit()
 
     ws, sslopt = create_websocket(api_client, cluster_id, on_text_message, on_binary_message)
+    log_debug("Created websocket")
     ws.run_forever(sslopt=sslopt)
+    log_debug("Ran forever")
 
     if exit_code:
         sys.exit(exit_code)
